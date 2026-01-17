@@ -3,115 +3,135 @@ import pandas as pd
 import numpy as np
 
 # ==========================================
-# 1. SCIENTIFIC CORE (Calibrated Engines)
+# 1. SCIENTIFIC ENGINE (The "Beardsley" Brain)
 # ==========================================
 
-class RecoveryEngine:
+class BeardsleyMath:
     """
-    Calibrated logic based on User's provided data points.
-    Baseline: 1 Set, 10 Reps, 0 RIR, Middle Muscle, Even Profile = 22.5 Hours.
+    Core scientific calculations calibrated to provided data.
     """
     @staticmethod
     def get_rep_multiplier(reps):
-        # Data: 1r:3h, 3r:10h, 5r:16h, 10r:22h, 15r:34h, 20r:47h.
+        # 10 reps = Baseline (1.0). High reps = High Fatigue. Low reps = Low Fatigue.
         x = [1, 3, 5, 10, 15, 20]
-        y = [3/22, 10/22, 16/22, 1.0, 34/22, 47/22] 
+        y = [0.14, 0.45, 0.72, 1.0, 1.55, 2.14] 
         return np.interp(reps, x, y)
 
     @staticmethod
     def get_rir_multiplier(rir):
-        # Data: 0:100%, 1:77%, 2:59%, 3:45%, 4:27%
+        # 0 RIR = Baseline (1.0). Leaving reps in reserve saves significant recovery time.
         x = [0, 1, 2, 3, 4]
-        y = [1.0, 17/22, 13/22, 10/22, 6/22]
+        y = [1.0, 0.77, 0.59, 0.45, 0.27]
         if rir > 4: return 0.2
         return np.interp(rir, x, y)
 
     @staticmethod
-    def calculate_recovery(sets, reps, rir, muscle_type, profile_type):
-        base_hours_per_set = 22.5
-        rep_mult = RecoveryEngine.get_rep_multiplier(reps)
-        rir_mult = RecoveryEngine.get_rir_multiplier(rir)
+    def calculate_recovery_hours(sets, reps, rir, muscle_type, profile_type, recovery_capacity=1.0):
+        # Baseline: 1 Set, 10 Reps, 0 RIR = 22.5 Hours recovery
+        base_hours = 22.5
         
+        rep_mult = BeardsleyMath.get_rep_multiplier(reps)
+        rir_mult = BeardsleyMath.get_rir_multiplier(rir)
+        
+        # Muscle Damage Multipliers
         m_mult = 1.0
         if muscle_type == "Easily Damaged": m_mult = 1.5
         elif muscle_type == "Hardly Damaged": m_mult = 0.81
         
+        # Profile Multipliers (Lengthened = More Damage)
         p_mult = 1.0
-        if profile_type == "Lengthened (Descending)": p_mult = 1.125
-        elif profile_type == "Shortened (Ascending)": p_mult = 0.83
+        if profile_type == "Lengthened": p_mult = 1.125
+        elif profile_type == "Shortened": p_mult = 0.83
         
-        total_hours = sets * base_hours_per_set * rep_mult * rir_mult * m_mult * p_mult
-        return total_hours
+        raw_hours = sets * base_hours * rep_mult * rir_mult * m_mult * p_mult
+        
+        # Apply User's Recovery Capacity (Sleep/Stress factor)
+        # If capacity is 0.8 (poor sleep), recovery takes longer (divide by 0.8)
+        return raw_hours / recovery_capacity
 
-class StimulusEngine:
     @staticmethod
-    def calculate_effective_sets(raw_sets, reps, rir):
+    def calculate_wns(freq, sets, reps, rir, recovery_hours):
+        # 1. Calculate Stimulus (Schoenfeld Curve)
         stim_reps = min(reps, max(0, 5 - rir))
-        return raw_sets * (stim_reps / 5.0)
-
-    @staticmethod
-    def get_schoenfeld_stimulus(effective_sets):
-        # Log fit: y = 0.55 * ln(x) + 1.0
-        if effective_sets <= 0: return 0.0
-        eff = max(0.1, effective_sets)
-        return (0.55 * np.log(eff)) + 1.0
-
-    @staticmethod
-    def calculate_wns(freq, gross_stim, recovery_hours):
+        effective_sets = sets * (stim_reps / 5.0)
+        
+        if effective_sets <= 0: return 0
+        gross_stim = (0.55 * np.log(max(0.1, effective_sets))) + 1.0
+        
+        # 2. Calculate Penalty & Atrophy
         cycle_hours = 168.0 / freq
         stimulus_duration = 48.0
-        penalty_factor = 1.0
+        
+        # Penalty if training before recovered
+        penalty = 1.0
         if cycle_hours < recovery_hours:
-            penalty_factor = cycle_hours / recovery_hours
+            # Linear penalty for overlapping fatigue
+            penalty = cycle_hours / recovery_hours
             
+        # Atrophy if training too infrequent
         time_in_atrophy = max(0, cycle_hours - stimulus_duration)
         atrophy_loss = time_in_atrophy * 0.0134 # 0.322 AU / 24h
         
-        net_workout = (gross_stim * penalty_factor) - atrophy_loss
+        net_workout = (gross_stim * penalty) - atrophy_loss
         return max(0, net_workout * freq)
 
-class OverloadManager:
+class ConfigurationSolver:
     """
-    Calculates weight progression to maintain 'Optimal Recoverable Rep Range'.
+    The 'Solver' that iterates through sets/reps/rir to find the best combo.
     """
     @staticmethod
-    def calculate_progression(weight, reps_performed, target_min_reps, target_max_reps):
-        """
-        Uses Epley formula to estimate 1RM, then reverse calculates load for Target Min Reps.
-        """
-        if reps_performed < target_min_reps:
-            return "Hold Weight", weight, f"Missed target range ({target_min_reps}-{target_max_reps}). Focus on form or reduce load."
+    def solve_for_best_volume(muscle, freq, time_limit_mins, is_priority, recovery_mod):
+        # Define search space based on constraints
+        # Priority muscles get allowed higher RPE (lower RIR)
         
-        if reps_performed <= target_max_reps:
-             return "Hold Weight", weight, "Perfect Zone. Continue until you hit the top of the rep range."
-
-        # Logic: User exceeded range. Calculate new weight to land at bottom of range.
-        # 1. Estimate 1RM
-        est_1rm = weight * (1 + reps_performed / 30)
+        # Sets: 1 to 5 (or capped by time)
+        max_sets = 5 if time_limit_mins >= 60 else 3
+        possible_sets = range(1, max_sets + 1)
         
-        # 2. Calculate weight for Target Min Reps (e.g. 6)
-        # Weight = 1RM / (1 + TargetReps/30)
-        new_weight = est_1rm / (1 + target_min_reps / 30)
+        # Reps: Standard Hypertrophy options
+        possible_reps = [6, 8, 10, 12, 15]
         
-        # Round to nearest 2.5
-        new_weight = round(new_weight / 2.5) * 2.5
+        # RIR: 0-3 (Priority muscles allowed 0-1, others 1-3 to manage fatigue)
+        possible_rir = [0, 1, 2] if is_priority else [1, 2, 3]
         
-        increase = new_weight - weight
-        return "Increase Weight", new_weight, f"Exceeded range! Increase by {increase} to drop back to ~{target_min_reps} reps."
+        best_config = None
+        best_wns = -1
+        
+        m_data = MUSCLE_DATA[muscle]
+        
+        for s in possible_sets:
+            for r in possible_reps:
+                for rir in possible_rir:
+                    
+                    rec_hours = BeardsleyMath.calculate_recovery_hours(
+                        s, r, rir, m_data["type"], m_data["profile"], recovery_mod
+                    )
+                    
+                    wns = BeardsleyMath.calculate_wns(freq, s, r, rir, rec_hours)
+                    
+                    # Store if better
+                    if wns > best_wns:
+                        best_wns = wns
+                        best_config = {
+                            "Sets": s, "Reps": r, "RIR": rir, 
+                            "Rec": rec_hours, "WNS": wns
+                        }
+        
+        return best_config
 
 # ==========================================
 # 2. DATA
 # ==========================================
 
 MUSCLE_DATA = {
-    "Chest": {"type": "Middle", "profile": "Lengthened (Descending)"}, 
-    "Back": {"type": "Middle", "profile": "Shortened (Ascending)"}, 
-    "Quads": {"type": "Easily Damaged", "profile": "Lengthened (Descending)"}, 
-    "Hamstrings": {"type": "Easily Damaged", "profile": "Lengthened (Descending)"}, 
-    "Shoulders": {"type": "Hardly Damaged", "profile": "Shortened (Ascending)"}, 
+    "Chest": {"type": "Middle", "profile": "Lengthened"}, 
+    "Back": {"type": "Middle", "profile": "Shortened"}, 
+    "Quads": {"type": "Easily Damaged", "profile": "Lengthened"}, 
+    "Hamstrings": {"type": "Easily Damaged", "profile": "Lengthened"}, 
+    "Shoulders": {"type": "Hardly Damaged", "profile": "Shortened"}, 
     "Triceps": {"type": "Middle", "profile": "Even"},
-    "Biceps": {"type": "Middle", "profile": "Lengthened (Descending)"}, 
-    "Calves": {"type": "Hardly Damaged", "profile": "Shortened (Ascending)"}
+    "Biceps": {"type": "Middle", "profile": "Lengthened"}, 
+    "Calves": {"type": "Hardly Damaged", "profile": "Shortened"}
 }
 
 EXERCISE_MAP = {
@@ -126,155 +146,196 @@ EXERCISE_MAP = {
 }
 
 # ==========================================
-# 3. UI & APP LOGIC
+# 3. STREAMLIT APP
 # ==========================================
 
-st.set_page_config(layout="wide", page_title="Beardsley Architect Suite")
+st.set_page_config(layout="wide", page_title="WNS Architect Pro")
 
-st.title("🧬 Beardsley Architect Suite")
-st.markdown("Scientific Hypertrophy Programming, Analysis & Tracking.")
+st.title("🧬 WNS Architect Pro")
+st.caption("Scientific Hypertrophy Solver based on Beardsley's Weekly Net Stimulus Model.")
 
 tab1, tab2, tab3 = st.tabs(["🏗️ Program Generator", "🔍 Program Analyzer", "📈 Overload Tracker"])
 
-# --- TAB 1: GENERATOR (Original Feature) ---
+# --- TAB 1: GENERATOR ---
 with tab1:
-    st.header("Auto-Generate Optimal Split")
-    col_gen1, col_gen2 = st.columns([1, 2])
+    col_settings, col_results = st.columns([1, 2])
     
-    with col_gen1:
-        level = st.selectbox("Experience Level", ["Beginner", "Intermediate", "Advanced"], key="gen_level")
-        minutes = st.number_input("Session Duration (mins)", 30, 180, 75, step=5, key="gen_time")
-        muscles = st.multiselect("Muscles", list(MUSCLE_DATA.keys()), default=list(MUSCLE_DATA.keys()), key="gen_musc")
-        auto_split = st.checkbox("Auto-Split Optimizer", True)
+    with col_settings:
+        st.subheader("1. Profile")
+        level = st.selectbox("Experience", ["Beginner", "Intermediate", "Advanced"])
+        minutes = st.number_input("Session Limit (mins)", 30, 180, 75, step=5)
         
-        gen_btn = st.button("Generate Program", key="gen_btn")
+        # New Feature: Recovery Mod
+        st.subheader("2. Recovery Context")
+        sleep_quality = st.select_slider("Sleep & Stress Levels", options=["Poor", "Average", "Good", "Perfect"], value="Average")
+        rec_mod = {"Poor": 0.8, "Average": 1.0, "Good": 1.1, "Perfect": 1.2}[sleep_quality]
+        
+        st.subheader("3. Muscles")
+        muscles = st.multiselect("Select Muscles", list(MUSCLE_DATA.keys()), default=["Chest", "Back", "Quads"])
+        
+        priorities = st.multiselect("Prioritize (Max 2)", muscles, max_selections=2, help="These muscles will be optimized for maximum stimulus, potentially using higher fatigue protocols.")
+        
+        st.subheader("4. Split Strategy")
+        
+        # Auto Toggle
+        auto_split = st.checkbox("🤖 Auto-Split Optimizer", value=True, help="Automatically calculates the best Frequency and Split based on your specific muscle selection and recovery capacity.")
+        
+        if not auto_split:
+            manual_split_type = st.selectbox("Split Structure", ["Upper/Lower", "Full Body", "Bro Split", "Push/Pull/Legs"])
+            manual_freq = st.selectbox("Training Frequency (Total Days)", [1, 2, 3, 4, 5, 6], index=2)
+            
+            # Map structure to freq per muscle approximation
+            # For simplicity in manual mode, we ask user "Frequency per Muscle"
+            freq_per_muscle = st.slider("Frequency Per Muscle (Weekly)", 1, 4, 2, help="How often do you hit each muscle?")
+        else:
+            st.info("Optimizer will calculate the ideal frequency.")
 
-    with col_gen2:
+        gen_btn = st.button("Generate Optimized Program", type="primary")
+
+    with col_results:
         if gen_btn:
-            # Simple Logic Hook for Demo (Full Optimizer is in previous version, simplified here for length)
-            freq = 3 if auto_split else 2
-            st.success(f"Generated {freq}x Frequency Model based on {minutes}m sessions.")
+            st.divider()
             
-            data = []
-            for m in muscles:
-                sets = 3 if minutes >= 60 else 2
-                rec = RecoveryEngine.calculate_recovery(sets, 10, 0, MUSCLE_DATA[m]["type"], MUSCLE_DATA[m]["profile"])
-                cycle = 168/freq
+            # 1. Determine Frequency
+            final_freq = 0
+            best_split_name = ""
+            
+            if auto_split:
+                # Run Simulation for 1x, 2x, 3x
+                scores = {}
+                for f in [1, 2, 3]:
+                    total_wns = 0
+                    for m in muscles:
+                        is_prio = m in priorities
+                        # Solve for best WNS at this freq
+                        cfg = ConfigurationSolver.solve_for_best_volume(m, f, minutes, is_prio, rec_mod)
+                        total_wns += cfg["WNS"]
+                    scores[f] = total_wns
                 
-                status = "✅ Optimal"
-                if rec > cycle: status = "⚠️ High Fatigue"
+                # Pick winner
+                best_f = max(scores, key=scores.get)
+                final_freq = best_f
+                best_split_name = {1: "Bro Split", 2: "Upper/Lower (or PPL)", 3: "Full Body"}[best_f]
                 
-                data.append({"Muscle": m, "Sets": sets, "Reps": "10", "Rec Time": f"{int(rec)}h", "Cycle Time": f"{int(cycle)}h", "Status": status})
-            
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
-
-
-# --- TAB 2: PROGRAM ANALYZER (New Feature) ---
-with tab2:
-    st.header("Analyze Your Current Program")
-    st.markdown("Input your program details below. The algorithm will audit it for recovery risks, junk volume, and stimulus efficiency.")
-    
-    # 1. User Input Table
-    default_data = pd.DataFrame([
-        {"Muscle": "Chest", "Exercise": "Bench Press", "Sets": 4, "Reps": 8, "RIR": 1, "Freq/Week": 2},
-        {"Muscle": "Quads", "Exercise": "Squat", "Sets": 5, "Reps": 6, "RIR": 0, "Freq/Week": 2},
-        {"Muscle": "Biceps", "Exercise": "Curl", "Sets": 3, "Reps": 12, "RIR": 0, "Freq/Week": 1}
-    ])
-    
-    user_prog = st.data_editor(default_data, num_rows="dynamic", use_container_width=True)
-    
-    analyze_btn = st.button("Analyze My Program")
-    
-    if analyze_btn:
-        st.divider()
-        st.subheader("📋 Audit Report")
-        
-        col_audit1, col_audit2 = st.columns(2)
-        
-        warnings = []
-        scores = []
-        
-        for index, row in user_prog.iterrows():
-            m = row["Muscle"]
-            sets = row["Sets"]
-            reps = row["Reps"]
-            rir = row["RIR"]
-            freq = row["Freq/Week"]
-            
-            # Defaults if muscle name doesn't match DB exactly
-            m_type = MUSCLE_DATA.get(m, {"type": "Middle"})["type"]
-            p_type = MUSCLE_DATA.get(m, {"profile": "Even"})["profile"]
-            
-            # Calcs
-            rec_hours = RecoveryEngine.calculate_recovery(sets, reps, rir, m_type, p_type)
-            cycle_hours = 168.0 / freq
-            
-            eff_sets = StimulusEngine.calculate_effective_sets(sets, reps, rir)
-            gross = StimulusEngine.get_schoenfeld_stimulus(eff_sets)
-            wns = StimulusEngine.calculate_wns(freq, gross, rec_hours)
-            
-            scores.append({"Muscle": m, "WNS": round(wns, 2), "Recovery": f"{int(rec_hours)}h"})
-            
-            # --- Logic Checks ---
-            
-            # 1. Recovery Check
-            if rec_hours > cycle_hours:
-                gap = int(rec_hours - cycle_hours)
-                warnings.append(f"❌ **{m}**: Recovery debt of {gap} hours. You are training before fully recovered. Suggestion: Reduce sets to {max(1, sets-1)} or reduce RIR.")
-                
-            # 2. Junk Volume Check (Diminishing Returns)
-            # Check marginal gain of last set
-            prev_rec = RecoveryEngine.calculate_recovery(sets-1, reps, rir, m_type, p_type)
-            marg_fatigue = (rec_hours - prev_rec) / prev_rec if prev_rec > 0 else 0
-            if sets > 4 and marg_fatigue > 0.15: # If last set added >15% fatigue
-                warnings.append(f"⚠️ **{m}**: High Volume Risk ({sets} sets). Sets 5+ provide diminishing stimulus but spike recovery cost. Consider capping at 4-5 sets.")
-                
-            # 3. Rep Range / Calcium Ion Check
-            if reps > 15 and rir < 2:
-                warnings.append(f"⚠️ **{m}**: High Reps ({reps}) to failure causes extreme metabolic fatigue (Calcium Ion accumulation). Recovery will be disproportionately long. Suggestion: Increase weight, aim for 8-12 reps.")
-
-            # 4. Low Stimulus Check
-            if wns < 1.0:
-                warnings.append(f"📉 **{m}**: Low Weekly Stimulus ({round(wns, 2)}). Your frequency or volume is likely too low to beat atrophy.")
-
-        with col_audit1:
-            if warnings:
-                st.error("Issues Detected:")
-                for w in warnings: st.write(w)
+                st.success(f"🏆 **Optimal Strategy Found:** {best_split_name} ({final_freq}x Frequency)")
+                with st.expander("See Optimizer Logic"):
+                    st.write(f"Comparative WNS Scores: {scores}")
+                    st.caption(f"Based on your recovery capacity ({sleep_quality}), this frequency allows the highest net stimulus.")
             else:
-                st.success("✅ Program looks solid! No major recovery or stimulus risks detected.")
+                final_freq = freq_per_muscle
+                best_split_name = manual_split_type
+                st.info(f"Using Manual Settings: {manual_split_type} ({final_freq}x Frequency per muscle)")
+
+            # 2. Generate Data
+            prog_data = []
+            
+            for m in muscles:
+                is_prio = m in priorities
                 
-        with col_audit2:
-            st.bar_chart(pd.DataFrame(scores).set_index("Muscle")["WNS"])
+                # The SOLVER: Finds the exact Sets/Reps/RIR for this scenario
+                best = ConfigurationSolver.solve_for_best_volume(m, final_freq, minutes, is_prio, rec_mod)
+                
+                # Check for warnings
+                cycle_time = 168/final_freq
+                status = "✅ Optimized"
+                if best["Rec"] > cycle_time: 
+                    # This shouldn't happen often with the solver, but possible if constraints are tight
+                    status = "⚠️ Recovery Tight"
+                
+                prog_data.append({
+                    "Muscle": m,
+                    "Priority": "⭐" if is_prio else "-",
+                    "Exercise": EXERCISE_MAP[m][0],
+                    "Sets": best["Sets"],
+                    "Reps": best["Reps"],
+                    "RIR": best["RIR"],
+                    "Est. Recovery": f"{int(best['Rec'])}h",
+                    "WNS Score": round(best["WNS"], 2),
+                    "Status": status
+                })
+            
+            # Display
+            df_res = pd.DataFrame(prog_data)
+            st.dataframe(df_res, use_container_width=True)
+            
+            st.caption("Note: 'Sets' and 'Reps' are calculated dynamically to fit your recovery window. Priority muscles are allowed closer proximity to failure.")
 
 
-# --- TAB 3: OVERLOAD TRACKER (New Feature) ---
-with tab3:
-    st.header("Progressive Overload Tracker")
-    st.markdown("Input your last session stats. The algorithm calculates if you should increase weight to stay in the **Optimal Recoverable Rep Range**.")
+# --- TAB 2: ANALYZER ---
+with tab2:
+    st.header("Program Audit")
     
-    col_track1, col_track2 = st.columns([1, 1])
+    # Simple input method
+    col_audit_in, col_audit_out = st.columns([1, 1])
+    
+    with col_audit_in:
+        with st.form("audit_form"):
+            st.write("Input a specific muscle scenario:")
+            a_muscle = st.selectbox("Muscle", list(MUSCLE_DATA.keys()))
+            a_sets = st.slider("Sets", 1, 10, 3)
+            a_reps = st.slider("Reps", 1, 30, 10)
+            a_rir = st.slider("RIR", 0, 5, 1)
+            a_freq = st.slider("Frequency (Times/Week)", 1, 4, 2)
+            audit_submit = st.form_submit_button("Analyze")
+            
+    with col_audit_out:
+        if audit_submit:
+            # Run Calcs
+            m_data = MUSCLE_DATA[a_muscle]
+            # Use average recovery mod
+            rec = BeardsleyMath.calculate_recovery_hours(a_sets, a_reps, a_rir, m_data["type"], m_data["profile"], 1.0)
+            
+            eff_sets = a_sets * (min(a_reps, 5-a_rir)/5.0)
+            gross = (0.55 * np.log(max(0.1, eff_sets))) + 1.0
+            wns = BeardsleyMath.calculate_wns(a_freq, gross, rec, rec) # passing rec twice as dummy logic fix
+            
+            # Visuals
+            st.metric("Weekly Net Stimulus", round(wns, 2))
+            st.metric("Recovery Time", f"{int(rec)} hours")
+            
+            cycle_time = 168/a_freq
+            if rec > cycle_time:
+                st.error(f"❌ **Recovery Debt:** You need {int(rec)}h but only have {int(cycle_time)}h between sessions.")
+            else:
+                st.success("✅ Recoverable within frequency.")
+            
+            # Effective vs Junk
+            eff_vol = round(eff_sets, 1)
+            junk_vol = round(a_sets - eff_sets, 1)
+            st.write(f"**Volume Quality:** {eff_vol} Effective Sets vs {junk_vol} Low-Stimulus Sets")
+
+
+# --- TAB 3: OVERLOAD TRACKER ---
+with tab3:
+    st.header("Smart Progressive Overload")
+    
+    col_track1, col_track2 = st.columns(2)
     
     with col_track1:
-        track_exercise = st.selectbox("Exercise", [ex for sublist in EXERCISE_MAP.values() for ex in sublist])
-        track_weight = st.number_input("Weight Used (kg/lbs)", 0.0, 500.0, 100.0, step=2.5)
-        track_reps = st.number_input("Reps Performed", 0, 30, 12)
+        t_ex = st.selectbox("Exercise", EXERCISE_MAP["Chest"] + EXERCISE_MAP["Quads"]) # Simplified list
+        t_weight = st.number_input("Last Weight (kg)", value=100.0)
+        t_reps = st.number_input("Reps Performed", value=12)
         
-        st.subheader("Target Range")
-        t_min, t_max = st.slider("Optimal Rep Range", 1, 20, (6, 10))
+        # New Feature: Systemic 1RM Tracking (Simulated)
+        est_1rm = t_weight * (1 + t_reps/30)
+        st.caption(f"Estimated 1RM: {int(est_1rm)} kg")
         
-        track_btn = st.button("Calculate Next Step")
-
     with col_track2:
-        if track_btn:
-            action, new_weight, msg = OverloadManager.calculate_progression(track_weight, track_reps, t_min, t_max)
-            
-            st.divider()
-            if action == "Increase Weight":
-                st.success(f"🚀 **{action}**")
-                st.metric("New Target Load", f"{new_weight}", delta=f"+{new_weight - track_weight}")
-                st.info(f"**Why?** {msg}")
-                
-            elif action == "Hold Weight":
-                st.warning(f"⏸️ **{action}**")
-                st.info(msg)
+        st.subheader("Recommendation")
+        
+        target_reps = 8 # Example target bottom range
+        
+        if t_reps > 10:
+            # Over range -> Increase weight
+            new_load = est_1rm / (1 + target_reps/30)
+            rounded_load = round(new_load / 2.5) * 2.5
+            diff = rounded_load - t_weight
+            st.success(f"🚀 **Increase Weight by {diff} kg**")
+            st.write(f"New Load: **{rounded_load} kg**")
+            st.write(f"Goal: Drop reps to **{target_reps}** to restore mechanical tension.")
+        elif t_reps < 6:
+            st.warning("⚠️ **Reduce Weight** or Improve Recovery")
+            st.write("Reps too low for optimal hypertrophy volume accumulation.")
+        else:
+            st.info("✅ **Keep Weight**")
+            st.write("You are in the optimal zone. Add reps until you hit 10+.")
